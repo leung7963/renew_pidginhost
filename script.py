@@ -16,7 +16,7 @@ from base64 import b64encode
 
 # ---------- 环境变量 ----------
 API_TOKEN        = os.getenv('PIDGINHOST_API_TOKEN')      # PidginHost API Token
-PANEL_BASE       = 'https://www.pidginhost.com/'
+PANEL_BASE       = 'https://www.pidginhost.com/panel'
 PROXY            = os.getenv('PROXY_SERVER')
 TG_TOKEN         = os.getenv('TG_BOT_TOKEN')
 TG_CHAT          = os.getenv('TG_CHAT_ID')
