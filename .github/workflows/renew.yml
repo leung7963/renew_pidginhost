@@ -20,8 +20,7 @@ jobs:
           python-version: '3.11'
 
       - name: 📦 安装 Python 依赖（含 SOCKS 支持）
-        run: pip install requests[socks]
-             pip install pynacl
+        run: pip install requests[socks] pynacl
 
       - name: 🔗 配置代理（sing-box）
         if: env.NODE_LINK != ''
