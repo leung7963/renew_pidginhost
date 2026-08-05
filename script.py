@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
 """
-PidginHost 自动续期脚本（最终修复版）
-- 通过 API 获取所有云服务器
-- 逐台调用面板续期接口
-- 从 Session 中可靠提取 sessionid / csrftoken（不受 domain/path 限制）
-- 自动更新 GitHub Secret（仅当 cookie 有效）
-- 发送 Telegram 通知
+PidginHost 自动续期脚本（可靠提取 sessionid）
+- 续期前后分别记录 cookie，避免因响应无 Set-Cookie 而丢失 sessionid
+- 自动更新 GitHub Secret（仅当 cookie 完整）
+- Telegram 通知
 """
 
-import os
-import sys
-import re
-import json
-import requests
+import os, sys, re, json, requests
 from urllib.parse import urljoin
 from base64 import b64encode
 
@@ -29,7 +23,7 @@ GITHUB_REPO  = os.getenv('GITHUB_REPOSITORY')
 SECRET_NAME  = 'PANEL_COOKIE'
 
 if not API_TOKEN or not PANEL_COOKIE_RAW:
-    print('❌ 缺少必需的环境变量 PIDGINHOST_API_TOKEN 或 PANEL_COOKIE')
+    print('❌ 缺少必需的环境变量')
     sys.exit(1)
 
 proxies = {'http': PROXY, 'https': PROXY} if PROXY else None
@@ -47,10 +41,9 @@ if proxies:
 def apply_cookies(session, cookie_dict):
     session.cookies.clear()
     for name, value in cookie_dict.items():
-        # 不强制 domain/path，让 requests 自行推断
         session.cookies.set(name, value, domain='.pidginhost.com', path='/')
 
-# 解析初始 cookie
+# 解析初始 PANEL_COOKIE
 cookie_dict = {}
 raw = PANEL_COOKIE_RAW.strip()
 if raw.startswith('[') or raw.startswith('{'):
@@ -70,6 +63,8 @@ if not cookie_dict:
             k, v = pair.split('=', 1)
             cookie_dict[k.strip()] = v.strip()
 
+# 调试：打印初始解析到的 cookie 键（确认 sessionid 存在）
+print(f'[DEBUG] 初始 cookie 键: {list(cookie_dict.keys())}')
 apply_cookies(panel_session, cookie_dict)
 
 # ---------- 工具函数 ----------
@@ -85,7 +80,7 @@ def get_csrf_token(session, url):
     resp = session.get(url)
     if resp.status_code != 200:
         return None, resp
-    # 从 cookie 获取 csrftoken（不限定 domain/path，先尝试宽松获取）
+    # 从 cookies 中获取 csrftoken（遍历）
     csrf = None
     for c in session.cookies:
         if c.name == 'csrftoken':
@@ -94,25 +89,18 @@ def get_csrf_token(session, url):
     if not csrf:
         match = re.search(r'name="csrfmiddlewaretoken"\s+value="([^"]+)"', resp.text)
         csrf = match.group(1) if match else None
-    # 统一写回，保证后续请求能带正确 token
     if csrf:
         session.cookies.set('csrftoken', csrf, domain='.pidginhost.com', path='/')
     return csrf, resp
 
-def extract_cookies_from_session(session):
-    """
-    遍历 cookie jar，提取 sessionid 和 csrftoken。
-    不依赖 domain/path 参数，适应性最强。
-    """
-    sid = None
-    tok = None
+def get_cookies_dict(session):
+    """遍历 cookie jar，提取 sessionid 和 csrftoken"""
+    sid = tok = None
     for c in session.cookies:
         if c.name == 'sessionid':
             sid = c.value
-            print(f'[DEBUG] sessionid: {c.value} (domain={c.domain}, path={c.path})')
         elif c.name == 'csrftoken':
             tok = c.value
-            print(f'[DEBUG] csrftoken: {c.value} (domain={c.domain}, path={c.path})')
     return {'sessionid': sid, 'csrftoken': tok}
 
 def renew_server_via_panel(server_id):
@@ -121,22 +109,34 @@ def renew_server_via_panel(server_id):
     if not csrf_token:
         return False, "无法获取 CSRF token", None
 
+    # 🔑 续期前记录当前的 sessionid 和 csrftoken
+    pre_cookies = get_cookies_dict(panel_session)
+    print(f'[DEBUG] 续期前 cookies: {pre_cookies}')
+
     data = {'csrfmiddlewaretoken': csrf_token, 'action': 'extend_renewal'}
     headers = {'Referer': url, 'X-CSRFToken': csrf_token}
     post_resp = panel_session.post(url, data=data, headers=headers, allow_redirects=False)
 
-    # 强制合并响应 Set-Cookie
+    # 合并响应中的 Set-Cookie
     for cookie in post_resp.cookies:
         panel_session.cookies.set(cookie.name, cookie.value,
                                   domain=cookie.domain or '.pidginhost.com',
                                   path=cookie.path or '/')
 
-    # 提取最新 cookie（使用遍历法）
-    latest = extract_cookies_from_session(panel_session)
+    # 续期后提取 cookies
+    post_cookies = get_cookies_dict(panel_session)
+    print(f'[DEBUG] 续期后 cookies: {post_cookies}')
+
+    # 回退策略：若某项为 None，则使用续期前的值
+    final_cookies = {
+        'sessionid': post_cookies['sessionid'] or pre_cookies['sessionid'],
+        'csrftoken': post_cookies['csrftoken'] or pre_cookies['csrftoken']
+    }
+    print(f'[DEBUG] 最终使用 cookies: {final_cookies}')
 
     success = post_resp.status_code == 302
     msg = "续期成功" if success else f"续期失败 (状态码 {post_resp.status_code})"
-    return success, msg, latest
+    return success, msg, final_cookies
 
 def update_github_secret(cookie_data):
     if not GITHUB_TOKEN or not GITHUB_REPO:
@@ -144,7 +144,7 @@ def update_github_secret(cookie_data):
     try:
         from nacl import encoding, public
     except ImportError:
-        print('❌ 缺少 PyNaCl 库，请 pip install pynacl')
+        print('❌ 缺少 PyNaCl，请 pip install pynacl')
         return False
 
     cookie_list = [
@@ -159,8 +159,7 @@ def update_github_secret(cookie_data):
         key_resp = requests.get(pub_key_url, headers=headers)
         key_resp.raise_for_status()
         key_data = key_resp.json()
-        key_id = key_data['key_id']
-        pub_key = key_data['key']
+        key_id, pub_key = key_data['key_id'], key_data['key']
 
         public_key = public.PublicKey(pub_key.encode("utf-8"), encoding.Base64Encoder())
         sealed_box = public.SealedBox(public_key)
@@ -168,8 +167,7 @@ def update_github_secret(cookie_data):
         encrypted_value = b64encode(encrypted).decode("utf-8")
 
         api_url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/secrets/{SECRET_NAME}"
-        put_resp = requests.put(api_url, headers=headers, json={"encrypted_value": encrypted_value, "key_id": key_id})
-        put_resp.raise_for_status()
+        requests.put(api_url, headers=headers, json={"encrypted_value": encrypted_value, "key_id": key_id}).raise_for_status()
         print(f'✅ GitHub secret {SECRET_NAME} 已更新')
         return True
     except Exception as e:
@@ -204,7 +202,7 @@ def main():
 
         renewed, failed = 0, 0
         details = []
-        latest_cookies = extract_cookies_from_session(panel_session)
+        latest_cookies = get_cookies_dict(panel_session)
 
         for s in servers:
             sid, name = s['id'], s.get('name', '未命名')
@@ -221,9 +219,9 @@ def main():
                 failed += 1
                 details.append(f'❌ {sid} ({name}): {msg}')
 
-        print(f'🔐 最新 Cookie: sessionid={latest_cookies["sessionid"]}, csrftoken={latest_cookies["csrftoken"]}')
+        print(f'🔐 最终 Cookie: sessionid={latest_cookies["sessionid"]}, csrftoken={latest_cookies["csrftoken"]}')
 
-        # 仅当 cookie 完整才更新 Secret
+        # 只有完整的 cookie 才更新 Secret
         if renewed > 0 and latest_cookies['sessionid'] and latest_cookies['csrftoken']:
             update_github_secret(latest_cookies)
         elif renewed > 0:
