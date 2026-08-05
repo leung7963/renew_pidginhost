@@ -5,6 +5,8 @@ import re
 import json
 import requests
 from urllib.parse import urljoin
+from base64 import b64encode
+from nacl import encoding, public  # pip install pynacl
 
 # ---------- 配置 ----------
 API_TOKEN = os.getenv('PIDGINHOST_API_TOKEN')
@@ -14,10 +16,10 @@ TG_TOKEN = os.getenv('TG_BOT_TOKEN')
 TG_CHAT = os.getenv('TG_CHAT_ID')
 PANEL_COOKIE_RAW = os.getenv('PANEL_COOKIE')          # 初始 cookie
 
-# GitHub 相关，仅当需要自动更新 secret 时设置
-GITHUB_TOKEN = os.getenv('GH_PAT')                    # 具有 repo scope 的 PAT
-GITHUB_REPO = os.getenv('GITHUB_REPOSITORY')          # 例如 "user/repo"
-SECRET_NAME = 'PANEL_COOKIE'                          # 要更新的 secret 名
+# GitHub 相关（可选）
+GITHUB_TOKEN = os.getenv('GH_PAT')
+GITHUB_REPO = os.getenv('GITHUB_REPOSITORY')
+SECRET_NAME = 'PANEL_COOKIE'
 
 if not API_TOKEN:
     print('❌ 缺少 PIDGINHOST_API_TOKEN')
@@ -28,7 +30,7 @@ if not PANEL_COOKIE_RAW:
 
 proxies = {'http': PROXY, 'https': PROXY} if PROXY else None
 
-# ---------- API session ----------
+# ---------- 创建 session ----------
 api_session = requests.Session()
 api_session.headers.update({
     'Authorization': f'Token {API_TOKEN}',
@@ -37,10 +39,18 @@ api_session.headers.update({
 if proxies:
     api_session.proxies.update(proxies)
 
-# ---------- Panel session ----------
 panel_session = requests.Session()
 if proxies:
     panel_session.proxies.update(proxies)
+
+# ---------- 统一设置 cookie（避免重复） ----------
+def apply_cookies(session, cookie_dict):
+    """安全地将 cookie 字典应用到 session，确保 domain/path 一致"""
+    session.cookies.clear()
+    domain = '.pidginhost.com'  # 面板域名
+    path = '/'
+    for name, value in cookie_dict.items():
+        session.cookies.set(name, value, domain=domain, path=path)
 
 # 解析初始 PANEL_COOKIE
 cookie_dict = {}
@@ -62,7 +72,8 @@ if not cookie_dict:
         if '=' in pair:
             k, v = pair.split('=', 1)
             cookie_dict[k] = v
-panel_session.cookies.update(cookie_dict)
+
+apply_cookies(panel_session, cookie_dict)  # 应用初始 cookie
 
 # ---------- 工具函数 ----------
 def send_tg(text):
@@ -80,16 +91,16 @@ def get_csrf_token(session, url):
     resp = session.get(url)
     if resp.status_code != 200:
         return None, resp
-    # 从 cookies 获取 csrftoken
-    csrf_cookie = session.cookies.get('csrftoken')
+    # 优先从 cookie 中获取（服务器响应可能已更新）
+    csrf_cookie = session.cookies.get('csrftoken', domain='.pidginhost.com', path='/')
     if not csrf_cookie:
-        # 从 HTML 中提取备用
+        # 备用：从 HTML 中提取
         match = re.search(r'name="csrfmiddlewaretoken"\s+value="([^"]+)"', resp.text)
         csrf_cookie = match.group(1) if match else None
     return csrf_cookie, resp
 
 def renew_server_via_panel(server_id):
-    """续期单台服务器，返回 (成功标志, 消息, 更新后的cookies字典)"""
+    """续期单台服务器，返回 (成功标志, 消息, 最新 cookies 字典)"""
     url = urljoin(PANEL_BASE, f'panel/cloud/servers/{server_id}/')
     csrf_token, resp = get_csrf_token(panel_session, url)
     if not csrf_token:
@@ -97,24 +108,29 @@ def renew_server_via_panel(server_id):
             return False, "Cookie 过期或无效", None
         return False, f"无法获取 CSRF token (状态码 {resp.status_code})", None
 
+    # 将最新 csrf_token 同步到 cookie 中（覆盖旧值）
+    panel_session.cookies.set('csrftoken', csrf_token, domain='.pidginhost.com', path='/')
+
     data = {'csrfmiddlewaretoken': csrf_token, 'action': 'extend_renewal'}
     headers = {'Referer': url, 'X-CSRFToken': csrf_token}
     post_resp = panel_session.post(url, data=data, headers=headers, allow_redirects=False)
 
+    # 无论成功与否，抓取最新的 sessionid 和 csrftoken
+    latest_cookies = {
+        'sessionid': panel_session.cookies.get('sessionid', domain='.pidginhost.com', path=''),
+        'csrftoken': panel_session.cookies.get('csrftoken', domain='.pidginhost.com', path='')
+    }
+
     if post_resp.status_code == 302:
-        # 成功后续期，立即抓取最新 cookies
-        latest_cookies = get_current_cookies()
         return True, "续期成功", latest_cookies
     else:
-        # 失败也抓取一次（可能 cookie 被更新了，但不算续期成功）
-        latest_cookies = get_current_cookies()
         return False, f"续期失败 (状态码 {post_resp.status_code})", latest_cookies
 
 def get_current_cookies():
-    """返回当前 panel_session 中 sessionid 和 csrftoken 组成的字典"""
+    """返回当前 session 中 sessionid 和 csrftoken 组成的字典"""
     return {
-        'sessionid': panel_session.cookies.get('sessionid', ''),
-        'csrftoken': panel_session.cookies.get('csrftoken', '')
+        'sessionid': panel_session.cookies.get('sessionid', domain='.pidginhost.com', path=''),
+        'csrftoken': panel_session.cookies.get('csrftoken', domain='.pidginhost.com', path='')
     }
 
 def update_github_secret(cookie_data):
@@ -123,45 +139,35 @@ def update_github_secret(cookie_data):
         print('⚠️ 未配置 GitHub 信息，跳过 secret 更新')
         return False
 
-    # 构造新 cookie 字符串（复用原格式：JSON 数组）
+    # 构造 JSON 数组格式
     cookie_list = [
         {"name": "sessionid", "value": cookie_data['sessionid']},
         {"name": "csrftoken", "value": cookie_data['csrftoken']}
     ]
     new_value = json.dumps(cookie_list)
 
-    # 调用 GitHub API 更新 secret
-    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/secrets/{SECRET_NAME}"
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    payload = {
-        "encrypted_value": None,
-        "key_id": None
-    }
-    # 先获取公钥
-    pub_key_url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/secrets/public-key"
     try:
+        # 获取公钥
+        pub_key_url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/secrets/public-key"
+        headers = {
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json"
+        }
         key_resp = requests.get(pub_key_url, headers=headers)
         key_resp.raise_for_status()
         key_data = key_resp.json()
         key_id = key_data['key_id']
         pub_key = key_data['key']
 
-        # 加密 secret
-        from base64 import b64encode
-        from nacl import encoding, public  # 需要安装 PyNaCl: pip install pynacl
+        # 加密
         public_key = public.PublicKey(pub_key.encode("utf-8"), encoding.Base64Encoder())
         sealed_box = public.SealedBox(public_key)
         encrypted = sealed_box.encrypt(new_value.encode("utf-8"))
         encrypted_value = b64encode(encrypted).decode("utf-8")
 
-        payload = {
-            "encrypted_value": encrypted_value,
-            "key_id": key_id
-        }
-
+        # 更新 secret
+        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/secrets/{SECRET_NAME}"
+        payload = {"encrypted_value": encrypted_value, "key_id": key_id}
         put_resp = requests.put(api_url, headers=headers, json=payload)
         put_resp.raise_for_status()
         print(f'✅ GitHub secret {SECRET_NAME} 已更新')
@@ -184,7 +190,7 @@ def fetch_all_servers():
 # ---------- 主逻辑 ----------
 def main():
     try:
-        # 验证 Cookie 是否有效
+        # 验证初始 Cookie 是否有效
         test_url = urljoin(PANEL_BASE, 'panel/')
         test_resp = panel_session.get(test_url)
         if test_resp.status_code != 200:
@@ -200,7 +206,7 @@ def main():
         renewed = 0
         failed = 0
         details = []
-        latest_cookies = get_current_cookies()  # 初始状态
+        latest_cookies = get_current_cookies()
 
         for server in servers:
             sid = server['id']
@@ -209,7 +215,7 @@ def main():
 
             success, msg, new_cookies = renew_server_via_panel(sid)
             if new_cookies:
-                latest_cookies = new_cookies  # 保持最新
+                latest_cookies = new_cookies
 
             if success:
                 print(f'✅ {msg}')
@@ -220,10 +226,9 @@ def main():
                 failed += 1
                 details.append(f'❌ 服务器 {sid} 续期失败: {msg}')
 
-        # 输出最新 cookie 信息（用于调试或手动更新）
         print(f'🔐 最新 Cookie: sessionid={latest_cookies["sessionid"]}, csrftoken={latest_cookies["csrftoken"]}')
-        # 尝试自动更新 GitHub secret
-        if renewed > 0:  # 只有成功续期后才更新，避免无效 cookie 覆盖有效 secret
+
+        if renewed > 0:  # 只有成功续期后才更新 secret
             update_github_secret(latest_cookies)
 
         summary = f'续期完成：成功 {renewed} 台，失败 {failed} 台'
