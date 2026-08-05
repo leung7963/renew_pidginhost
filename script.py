@@ -13,9 +13,9 @@ PANEL_BASE = 'https://www.pidginhost.com/'
 PROXY = os.getenv('PROXY_SERVER')
 TG_TOKEN = os.getenv('TG_BOT_TOKEN')
 TG_CHAT = os.getenv('TG_CHAT_ID')
-PANEL_COOKIE_RAW = os.getenv('PANEL_COOKIE')          # 从 Secrets 注入
-GH_PAT = os.getenv('GH_PAT')                          # 用于更新 Secrets 的 Personal Access Token
-GITHUB_REPOSITORY = os.getenv('GITHUB_REPOSITORY')    # 格式 owner/repo
+PANEL_COOKIE_RAW = os.getenv('PANEL_COOKIE')
+GH_PAT = os.getenv('GH_PAT')
+GITHUB_REPOSITORY = os.getenv('GITHUB_REPOSITORY')
 
 if not API_TOKEN:
     print('❌ 缺少 PIDGINHOST_API_TOKEN')
@@ -43,7 +43,6 @@ panel_session.cookies.clear()
 cookie_dict = {}
 raw = PANEL_COOKIE_RAW.strip()
 
-# 解析 Cookie
 if raw.startswith('[') or raw.startswith('{'):
     try:
         data = json.loads(raw)
@@ -121,7 +120,6 @@ def build_cookie_string(session):
     return "; ".join(pairs)
 
 def update_github_secret_via_gh(secret_name, secret_value):
-    """使用 gh CLI 更新 GitHub Secret"""
     if not GH_PAT or not GITHUB_REPOSITORY:
         print("⚠️ 未提供 GH_PAT 或 GITHUB_REPOSITORY，无法自动更新 Secret")
         return False
@@ -143,7 +141,7 @@ def update_github_secret_via_gh(secret_name, secret_value):
 # ---------- 主逻辑 ----------
 def main():
     try:
-        # 验证 Cookie 是否有效
+        # 验证 Cookie
         test_url = urljoin(PANEL_BASE, 'panel/')
         test_resp = panel_session.get(test_url)
         if test_resp.status_code != 200:
@@ -184,10 +182,15 @@ def main():
 
         # 提取最新 Cookie 并更新 Secret
         new_cookie = build_cookie_string(panel_session)
-        if update_github_secret_via_gh('PANEL_COOKIE', new_cookie):
-            send_tg('🔄 已自动更新 GitHub Secret PANEL_COOKIE')
+
+        updated = update_github_secret_via_gh('PANEL_COOKIE', new_cookie)
+        if updated:
+            status = '✅ 已自动更新 GitHub Secret PANEL_COOKIE'
         else:
-            send_tg(f'⚠️ 无法自动更新 Secret，请手动将以下内容更新到 PANEL_COOKIE:\n{new_cookie}')
+            status = '⚠️ 无法自动更新 Secret，请手动更新'
+
+        # 发送完整 Cookie 到 Telegram
+        send_tg(f"{status}\n最新 PANEL_COOKIE 值:\n{new_cookie}")
 
         sys.exit(0 if failed == 0 else 1)
 
