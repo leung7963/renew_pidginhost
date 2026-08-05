@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-PidginHost 自动续期脚本（通用版）
-- 保留并自动更新 **所有** 面板相关 cookie，不依赖具体 cookie 名称
-- 适用于任意 session cookie 名称（如 sessionid、pidginhost_session 等）
+PidginHost 自动续期脚本（通用版 + CSRF 变化通知）
+- 保留并自动更新 **所有** 面板相关 cookie
+- 续期结束后通过 Telegram 发送旧/新 csrftoken
 - 自动更新 GitHub Secret，支持 Telegram 通知
 """
 
@@ -20,7 +20,7 @@ PANEL_BASE       = 'https://www.pidginhost.com/'
 PROXY            = os.getenv('PROXY_SERVER')
 TG_TOKEN         = os.getenv('TG_BOT_TOKEN')
 TG_CHAT          = os.getenv('TG_CHAT_ID')
-PANEL_COOKIE_RAW = os.getenv('PANEL_COOKIE')          # 初始 cookie（JSON 对象或传统格式）
+PANEL_COOKIE_RAW = os.getenv('PANEL_COOKIE')          # 初始 cookie
 
 GITHUB_TOKEN     = os.getenv('GH_PAT')
 GITHUB_REPO      = os.getenv('GITHUB_REPOSITORY')
@@ -90,9 +90,7 @@ def get_all_cookies_from_session(session):
     return cookies
 
 def get_all_cookies_from_request(resp):
-    """
-    从请求头 Cookie 中提取所有 cookie（更可靠）
-    """
+    """从请求头 Cookie 中提取所有 cookie（更可靠）"""
     cookies = {}
     cookie_header = resp.request.headers.get('Cookie', '')
     if cookie_header:
@@ -106,11 +104,9 @@ def get_csrf_token(session, url):
     resp = session.get(url)
     if resp.status_code != 200:
         return None, resp
-    # 尝试从请求头 Cookie 中获取 csrftoken
     req_cookies = get_all_cookies_from_request(resp)
     csrf = req_cookies.get('csrftoken') or req_cookies.get('csrfmiddlewaretoken')
     if not csrf:
-        # 从 HTML 提取
         match = re.search(r'name="csrfmiddlewaretoken"\s+value="([^"]+)"', resp.text)
         csrf = match.group(1) if match else None
     if csrf:
@@ -153,7 +149,6 @@ def update_github_secret(cookie_dict):
         print('❌ 缺少 PyNaCl，请 pip install pynacl')
         return False
 
-    # 直接序列化为 JSON 对象
     new_value = json.dumps(cookie_dict)
 
     try:
@@ -202,14 +197,16 @@ def main():
         print('✅ Panel Cookie 有效')
 
         # 初始全部 cookie
-        latest_cookies = get_all_cookies_from_request(test_resp) or get_all_cookies_from_session(panel_session)
-        print(f'[INFO] 初始实际 cookie: {list(latest_cookies.keys())}')
+        initial_cookies = get_all_cookies_from_request(test_resp) or get_all_cookies_from_session(panel_session)
+        old_csrf = initial_cookies.get('csrftoken', '无')
+        print(f'[INFO] 初始 csrftoken: {old_csrf}')
 
         servers = fetch_all_servers()
         print(f'📋 找到 {len(servers)} 台服务器')
 
         renewed, failed = 0, 0
         details = []
+        latest_cookies = initial_cookies.copy()
 
         for s in servers:
             sid, name = s['id'], s.get('name', '未命名')
@@ -226,7 +223,8 @@ def main():
                 failed += 1
                 details.append(f'❌ {sid} ({name}): {msg}')
 
-        print(f'🔐 最终 Cookie 个数: {len(latest_cookies)}, 键: {list(latest_cookies.keys())}')
+        new_csrf = latest_cookies.get('csrftoken', '无')
+        print(f'[INFO] 最终 csrftoken: {new_csrf}')
 
         if renewed > 0 and latest_cookies:
             update_github_secret(latest_cookies)
@@ -234,10 +232,13 @@ def main():
             print('❌ 没有提取到任何 Cookie，不更新 Secret')
             send_tg('⚠️ 续期成功但 cookie 完全丢失，请手动更新 PANEL_COOKIE')
 
+        # 构建 Telegram 通知（包含 csrftoken 变化）
         summary = f'续期完成：成功 {renewed} 台，失败 {failed} 台'
+        full_text = f"PidginHost 续期\n{summary}\n详情：\n" + '\n'.join(details[-5:])
+        csrf_info = f"\n🔑 CSRF token 变化:\n旧值: {old_csrf}\n新值: {new_csrf}"
+        send_tg(('✅ ' if failed == 0 else '⚠️ ') + full_text + csrf_info)
+
         print(f'🎉 {summary}')
-        full_text = f"PidginHost 续期\n{summary}\n" + '\n'.join(details[-5:])
-        send_tg(('✅ ' if failed == 0 else '⚠️ ') + full_text)
         sys.exit(0 if failed == 0 else 1)
 
     except Exception as e:
