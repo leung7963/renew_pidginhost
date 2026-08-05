@@ -20,7 +20,7 @@ jobs:
           python-version: '3.11'
 
       - name: 📦 安装 Python 依赖（含 SOCKS 支持）
-        run: pip install requests[socks]
+        run: pip install requests[socks] pynacl
 
       - name: 🔗 配置代理（sing-box）
         if: env.NODE_LINK != ''
@@ -157,6 +157,7 @@ jobs:
           PIDGINHOST_API_TOKEN: ${{ secrets.PIDGINHOST_API_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
           PANEL_COOKIE: ${{ secrets.PANEL_COOKIE }}   # ✅ 关键修复：传递 Cookie
         run: python3 script.py
 
