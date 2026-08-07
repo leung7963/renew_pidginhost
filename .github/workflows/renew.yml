@@ -142,7 +142,7 @@ jobs:
             sleep 5
             if ss -tuln | grep -q ':1080'; then
               echo "✅ 代理已启动（127.0.0.1:1080）"
-              echo "PROXY_SERVER=socks5://127.0.0.1:1080" >> $GITHUB_ENV
+              echo "PROXY_SERVER=http://127.0.0.1:1080" >> $GITHUB_ENV
             else
               echo "❌ 代理启动失败，查看日志："
               cat sing-box.log
