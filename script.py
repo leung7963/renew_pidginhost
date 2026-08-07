@@ -206,6 +206,21 @@ def main():
             sys.exit(1)
         print('✅ Panel Cookie 有效')
 
+        # 🔑 第一时间提取最新 cookie（访问 Panel 后 session/csrf 可能已轮换）
+        latest_cookie = extract_panel_cookie(panel_session)
+        cookie_changed = False
+        if latest_cookie:
+            merged = dict(cookie_dict)
+            merged.update(latest_cookie)
+            cookie_dict = merged
+            PANEL_COOKIE_RAW = _serialize_cookie(merged)
+            cookie_changed = True
+            print(f'🔑 已第一时间提取最新 cookie: '
+                  f"sessionid={latest_cookie.get('sessionid','?')[-6:]}... "
+                  f"csrftoken={latest_cookie.get('csrftoken','?')[-6:]}...")
+            # 后续所有请求立即使用新 cookie
+            panel_session.cookies.update(latest_cookie)
+
         # 获取服务器列表
         print('📄 获取所有云服务器...')
         servers = fetch_all_servers()
@@ -214,8 +229,6 @@ def main():
         renewed = 0
         failed = 0
         details = []
-        latest_cookie = None
-        cookie_changed = False
 
         for server in servers:
             sid = server['id']
