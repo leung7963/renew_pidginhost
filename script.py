@@ -3,7 +3,6 @@ import os
 import sys
 import re
 import json
-import subprocess
 import requests
 from urllib.parse import urljoin
 
@@ -13,9 +12,7 @@ PANEL_BASE = 'https://www.pidginhost.com/'
 PROXY = os.getenv('PROXY_SERVER')
 TG_TOKEN = os.getenv('TG_BOT_TOKEN')
 TG_CHAT = os.getenv('TG_CHAT_ID')
-PANEL_COOKIE_RAW = os.getenv('PANEL_COOKIE')
-GH_PAT = os.getenv('GH_PAT')
-GITHUB_REPOSITORY = os.getenv('GITHUB_REPOSITORY')
+PANEL_COOKIE_RAW = os.getenv('PANEL_COOKIE')  # 字符串
 
 if not API_TOKEN:
     print('❌ 缺少 PIDGINHOST_API_TOKEN')
@@ -38,11 +35,13 @@ panel_session = requests.Session()
 if proxies:
     panel_session.proxies.update(proxies)
 
+# 清空可能存在的旧 cookies，避免重复
 panel_session.cookies.clear()
 
 cookie_dict = {}
 raw = PANEL_COOKIE_RAW.strip()
 
+# 尝试作为 JSON 解析（如果是数组）
 if raw.startswith('[') or raw.startswith('{'):
     try:
         data = json.loads(raw)
@@ -55,6 +54,7 @@ if raw.startswith('[') or raw.startswith('{'):
     except json.JSONDecodeError:
         pass
 
+# 如果未解析出任何 Cookie，尝试按传统格式解析
 if not cookie_dict:
     for pair in raw.split(';'):
         pair = pair.strip()
@@ -62,6 +62,7 @@ if not cookie_dict:
             k, v = pair.split('=', 1)
             cookie_dict[k] = v
 
+# 应用 Cookie（此时 session 已清空）
 panel_session.cookies.update(cookie_dict)
 
 # ---------- 工具函数 ----------
@@ -77,11 +78,13 @@ def get_csrf_token(session, url):
     resp = session.get(url)
     if resp.status_code != 200:
         return None, resp
+    # 从 cookies 中获取 csrftoken（避免重复异常）
     csrf_cookie = None
     for c in session.cookies:
         if c.name == 'csrftoken':
             csrf_cookie = c.value
             break
+    # 如果 cookie 中没有，从 HTML 中提取
     if not csrf_cookie:
         match = re.search(r'name="csrfmiddlewaretoken"\s+value="([^"]+)"', resp.text)
         csrf_cookie = match.group(1) if match else None
@@ -113,39 +116,14 @@ def fetch_all_servers():
         url = data.get('next')
     return items
 
-def build_cookie_string(session):
-    pairs = []
-    for cookie in session.cookies:
-        pairs.append(f"{cookie.name}={cookie.value}")
-    return "; ".join(pairs)
-
-def update_github_secret_via_gh(secret_name, secret_value):
-    if not GH_PAT or not GITHUB_REPOSITORY:
-        print("⚠️ 未提供 GH_PAT 或 GITHUB_REPOSITORY，无法自动更新 Secret")
-        return False
-    env = os.environ.copy()
-    env['GH_TOKEN'] = GH_PAT
-    cmd = [
-        'gh', 'secret', 'set', secret_name,
-        '--body', secret_value,
-        '--repo', GITHUB_REPOSITORY
-    ]
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    if result.returncode == 0:
-        print(f"✅ Secret {secret_name} 更新成功")
-        return True
-    else:
-        print(f"❌ 更新 Secret 失败: {result.stderr.strip()}")
-        return False
-
 # ---------- 主逻辑 ----------
 def main():
     try:
-        # 验证 Cookie
+        # 验证 Cookie 是否有效
         test_url = urljoin(PANEL_BASE, 'panel/')
         test_resp = panel_session.get(test_url)
         if test_resp.status_code != 200:
-            print('❌ Cookie 无效或已过期')
+            print('❌ Cookie 无效或已过期，请重新导出并更新 PANEL_COOKIE')
             send_tg('❌ PidginHost 续期失败：Cookie 无效或过期')
             sys.exit(1)
         print('✅ Panel Cookie 有效')
@@ -177,21 +155,7 @@ def main():
         summary = f'续期完成：成功 {renewed} 台，失败 {failed} 台'
         print(f'🎉 {summary}')
         full_text = f"PidginHost 续期\n{summary}\n详情：\n" + '\n'.join(details[-5:])
-        tg_status = '✅ ' if failed == 0 else '⚠️ '
-        send_tg(tg_status + full_text)
-
-        # 提取最新 Cookie 并更新 Secret
-        new_cookie = build_cookie_string(panel_session)
-
-        updated = update_github_secret_via_gh('PANEL_COOKIE', new_cookie)
-        if updated:
-            status = '✅ 已自动更新 GitHub Secret PANEL_COOKIE'
-        else:
-            status = '⚠️ 无法自动更新 Secret，请手动更新'
-
-        # 发送完整 Cookie 到 Telegram
-        send_tg(f"{status}\n最新 PANEL_COOKIE 值:\n{new_cookie}")
-
+        send_tg(('✅ ' if failed == 0 else '⚠️ ') + full_text)
         sys.exit(0 if failed == 0 else 1)
 
     except Exception as e:
