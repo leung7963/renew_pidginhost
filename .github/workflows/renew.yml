@@ -3,7 +3,7 @@ name: PidginHost Auto Renew
 on:
   schedule:
     # 每 10 天运行一次 (UTC 00:00)，即每 30 天约 3 次
-    - cron: '0 0 */2 * *'
+    - cron: '0 0 */10 * *'
   workflow_dispatch:   # 保留手动触发
 
 jobs:
