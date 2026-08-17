@@ -259,23 +259,20 @@ def main():
                 failed += 1
                 details.append(f'❌ 服务器 {sid} ({name}) 续期失败: {msg}')
 
-        # ---- 回写最新的 PANEL_COOKIE 到 GitHub Secret ----
+        # ---- 每次都把最新的 PANEL_COOKIE 回写到 GitHub Secret ----
         secret_msg = ''
-        if cookie_changed or latest_cookie:
-            old_cookie = os.getenv('PANEL_COOKIE', '')
-            # 比较新 cookie 是否真的不同于旧 Secret
-            if PANEL_COOKIE_RAW and PANEL_COOKIE_RAW != old_cookie:
-                ok, msg = update_github_secret(GITHUB_REPOSITORY, 'PANEL_COOKIE', PANEL_COOKIE_RAW)
-                secret_msg = msg
-                if ok:
-                    cookie_saved = True
-                    print(f'🔐 {msg}')
-                else:
-                    print(f'🔐 {msg}')
-                    send_tg(f'⚠️ Cookie 保存失败: {msg}')
+        if latest_cookie and PANEL_COOKIE_RAW:
+            ok, msg = update_github_secret(GITHUB_REPOSITORY, 'PANEL_COOKIE', PANEL_COOKIE_RAW)
+            secret_msg = msg
+            if ok:
+                cookie_saved = True
+                print(f'🔐 {msg}（{"cookie 已更新" if cookie_changed else "cookie 未变，仍同步保存"}）')
             else:
-                secret_msg = 'cookie 未发生变化，无需回写'
-                print(f'🔐 {secret_msg}')
+                print(f'🔐 {msg}')
+                send_tg(f'⚠️ Cookie 保存失败: {msg}')
+        else:
+            secret_msg = '未提取到 cookie，跳过回写'
+            print(f'🔐 {secret_msg}')
 
         summary = f'续期完成：成功 {renewed} 台，失败 {failed} 台'
         print(f'🎉 {summary}')
@@ -287,7 +284,7 @@ def main():
             csrf_v = latest_cookie.get('csrftoken', '(未变)')
             notice += f'\n\n🔑 最新 PANEL_COOKIE:\nsessionid={sid_v};\ncsrftoken={csrf_v};'
             if cookie_saved:
-                notice += '\n\n✅ 已自动回写到 GitHub Secret PANEL_COOKIE，下次运行生效'
+                notice += f'\n\n✅ 已自动回写到 GitHub Secret PANEL_COOKIE（每次运行自动同步）'
             else:
                 notice += f'\n\n⚠️ {secret_msg}'
                 notice += '\n\n⚠️ 如需自动保存，请确保已配置 GH_PAT Secret（GitHub Personal Access Token）'
