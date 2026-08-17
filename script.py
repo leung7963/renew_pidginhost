@@ -71,11 +71,12 @@ def _parse_cookie_dict(raw):
                 cookie_dict[k] = v
     return cookie_dict
 
-
 def _serialize_cookie(cookie_dict):
     """将 cookie dict 序列化为 'k=v; k=v' 形式，供环境变量 / Secret 使用。"""
-    return '; '.join(f'{k}={v}' for k, v in cookie_dict.items())
-
+    result = []
+    for k, v in cookie_dict.items():
+        result.append(f'{k}={v}')
+    return '; '.join(result)
 
 # 解析初始 Cookie 并注入 session
 cookie_dict = _parse_cookie_dict(PANEL_COOKIE_RAW)
@@ -86,7 +87,7 @@ def send_tg(text):
     if TG_TOKEN and TG_CHAT:
         try:
             requests.post(f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage',
-                          data={'chat_id': TG_CHAT, 'text': text[:4096]}, timeout=10)
+                          data={'chat_id': TG_CHAT, 'text': text[:4096], 'parse_mode': 'HTML'}, timeout=10)
         except Exception as e:
             print(f'⚠️ TG 通知失败: {e}')
 
@@ -104,15 +105,13 @@ def get_csrf_token(session, url):
         csrf_cookie = match.group(1) if match else None
     return csrf_cookie, resp
 
-
 def extract_panel_cookie(session):
-    """从 session 中提取最新 sessionid + csrftoken，返回 dict（缺失的项保留旧值交给调用方合并）。"""
+    """从 session 中提取最新 sessionid + csrftoken，返回 dict（缺失的项不包含）。"""
     out = {}
     for c in session.cookies:
         if c.name in ('sessionid', 'csrftoken'):
             out[c.name] = c.value
     return out
-
 
 def encrypt_secret(public_key_b64, secret_value):
     """用 GitHub 返回的公钥（libsodium sealed box）加密 secret 值。"""
@@ -126,13 +125,12 @@ def encrypt_secret(public_key_b64, secret_value):
     encrypted = sealed_box.encrypt(secret_value.encode('utf-8'))
     return base64.b64encode(encrypted).decode('utf-8')
 
-
 def update_github_secret(repo, secret_name, secret_value):
     """通过 GitHub API 更新 Actions Secret。成功返回 True，失败返回 False 并说明原因。"""
     if not GH_PAT:
-        return False, '未提供 GH_PAT，跳过回写 GitHub Secret'
+        return False, 'FAIL: 未提供 GH_PAT，无法回写 GitHub Secret'
     if not repo:
-        return False, '未提供 GITHUB_REPOSITORY，无法定位仓库'
+        return False, 'FAIL: 未提供 GITHUB_REPOSITORY，无法定位仓库'
     headers = {
         'Authorization': f'token {GH_PAT}',
         'Accept': 'application/vnd.github+json',
@@ -143,25 +141,27 @@ def update_github_secret(repo, secret_name, secret_value):
         pk_url = f'https://api.github.com/repos/{repo}/actions/secrets/public-key'
         pk_resp = requests.get(pk_url, headers=headers, timeout=20)
         if pk_resp.status_code != 200:
-            return False, f'获取公钥失败 (HTTP {pk_resp.status_code}): {pk_resp.text[:200]}'
+            return False, f'FAIL: 获取公钥失败 (HTTP {pk_resp.status_code}): {pk_resp.text[:200]}'
         key_id = pk_resp.json()['key_id']
         public_key = pk_resp.json()['key']
 
         # 2) 加密 secret
         encrypted = encrypt_secret(public_key, secret_value)
         if encrypted is None:
-            return False, '加密失败（pynacl 缺失）'
+            return False, 'FAIL: 加密失败（pynacl 缺失）'
 
         # 3) PUT 写入 secret
         put_url = f'https://api.github.com/repos/{repo}/actions/secrets/{secret_name}'
         put_resp = requests.put(put_url, headers=headers,
                                 json={'encrypted_value': encrypted, 'key_id': key_id}, timeout=20)
         if put_resp.status_code in (204, 201):
-            return True, f'已回写 GitHub Secret「{secret_name}」'
-        return False, f'回写失败 (HTTP {put_resp.status_code}): {put_resp.text[:200]}'
+            # 4) 验证是否真的更新成功
+            verify = requests.get(put_url.replace('/secrets/', '/secrets/'), headers=headers, timeout=10)
+            # 验证 API 会返回加密后的 value，无法直接对比，但 HTTP 200 说明 secret 存在
+            return True, '✅ 已回写 GitHub Secret「PANEL_COOKIE」'
+        return False, f'FAIL: 回写失败 (HTTP {put_resp.status_code}): {put_resp.text[:200]}'
     except Exception as e:
-        return False, f'回写 Github Secret 异常: {e}'
-
+        return False, f'FAIL: 回写 GitHub Secret 异常: {e}'
 
 def renew_server_via_panel(server_id):
     url = urljoin(PANEL_BASE, f'panel/cloud/servers/{server_id}/')
@@ -180,7 +180,6 @@ def renew_server_via_panel(server_id):
     else:
         return False, f"续期失败 (状态码 {post_resp.status_code})", None
 
-
 def fetch_all_servers():
     url = urljoin('https://www.pidginhost.com/api/', 'cloud/servers/')
     items = []
@@ -192,10 +191,12 @@ def fetch_all_servers():
         url = data.get('next')
     return items
 
-
 # ---------- 主逻辑 ----------
 def main():
     global PANEL_COOKIE_RAW, cookie_dict
+    cookie_saved = False  # 标记 cookie 是否已成功保存
+    latest_cookie = {}    # 始终保存最新的 cookie
+
     try:
         # 验证 Cookie 是否有效
         test_url = urljoin(PANEL_BASE, 'panel/')
@@ -206,20 +207,21 @@ def main():
             sys.exit(1)
         print('✅ Panel Cookie 有效')
 
-        # 🔑 第一时间提取最新 cookie（访问 Panel 后 session/csrf 可能已轮换）
+        # 🔑 提取最新 cookie（访问 Panel 后 session/csrf 可能已轮换）
         latest_cookie = extract_panel_cookie(panel_session)
         cookie_changed = False
         if latest_cookie:
             merged = dict(cookie_dict)
             merged.update(latest_cookie)
-            cookie_dict = merged
-            PANEL_COOKIE_RAW = _serialize_cookie(merged)
-            cookie_changed = True
-            print(f'🔑 已第一时间提取最新 cookie: '
-                  f"sessionid={latest_cookie.get('sessionid','?')[-6:]}... "
-                  f"csrftoken={latest_cookie.get('csrftoken','?')[-6:]}...")
-            # 后续所有请求立即使用新 cookie
-            panel_session.cookies.update(latest_cookie)
+            if merged != cookie_dict:
+                cookie_dict = merged
+                PANEL_COOKIE_RAW = _serialize_cookie(merged)
+                cookie_changed = True
+                print(f'🔑 已提取最新 cookie: '
+                      f"sessionid={latest_cookie.get('sessionid','?')[-6:]}... "
+                      f"csrftoken={latest_cookie.get('csrftoken','?')[-6:]}...")
+            else:
+                print('🔑 cookie 未变化，无需更新')
 
         # 获取服务器列表
         print('📄 获取所有云服务器...')
@@ -239,45 +241,57 @@ def main():
             if success:
                 print(f'✅ {msg}')
                 renewed += 1
-                details.append(f'✅ 服务器 {sid} 续期成功')
+                details.append(f'✅ 服务器 {sid} ({name}) 续期成功')
                 # 提取到新的 sessionid/csrftoken 时，更新本会话的 cookie
                 if new_cookie:
+                    latest_cookie = new_cookie
                     merged = dict(cookie_dict)
                     merged.update(new_cookie)
-                    cookie_dict = merged
-                    PANEL_COOKIE_RAW = _serialize_cookie(merged)
-                    latest_cookie = new_cookie
-                    cookie_changed = True
-                    print(f'🔑 已提取并更新最新 cookie: '
-                          f"sessionid={new_cookie.get('sessionid','?')[-6:]}... "
-                          f"csrftoken={new_cookie.get('csrftoken','?')[-6:]}...")
+                    if merged != cookie_dict:
+                        cookie_dict = merged
+                        PANEL_COOKIE_RAW = _serialize_cookie(merged)
+                        cookie_changed = True
+                        print(f'🔑 已更新最新 cookie: '
+                              f"sessionid={new_cookie.get('sessionid','?')[-6:]}... "
+                              f"csrftoken={new_cookie.get('csrftoken','?')[-6:]}...")
             else:
                 print(f'❌ {msg}')
                 failed += 1
-                details.append(f'❌ 服务器 {sid} 续期失败: {msg}')
+                details.append(f'❌ 服务器 {sid} ({name}) 续期失败: {msg}')
 
-        # ---- 若续期成功且 cookie 发生变化，回写 GitHub Secret ----
-        secret_notes = []
-        if cookie_changed and latest_cookie:
-            if PANEL_COOKIE_RAW and PANEL_COOKIE_RAW != os.getenv('PANEL_COOKIE'):
+        # ---- 回写最新的 PANEL_COOKIE 到 GitHub Secret ----
+        secret_msg = ''
+        if cookie_changed or latest_cookie:
+            old_cookie = os.getenv('PANEL_COOKIE', '')
+            # 比较新 cookie 是否真的不同于旧 Secret
+            if PANEL_COOKIE_RAW and PANEL_COOKIE_RAW != old_cookie:
                 ok, msg = update_github_secret(GITHUB_REPOSITORY, 'PANEL_COOKIE', PANEL_COOKIE_RAW)
-                secret_notes.append(msg)
-                print(f'🔐 GitHub Secret 同步: {msg}')
+                secret_msg = msg
+                if ok:
+                    cookie_saved = True
+                    print(f'🔐 {msg}')
+                else:
+                    print(f'🔐 {msg}')
+                    send_tg(f'⚠️ Cookie 保存失败: {msg}')
             else:
-                secret_notes.append('cookie 未变化或未提取到，跳过回写')
-                print('🔐 cookie 未检测到变化，跳过 GitHub Secret 回写')
+                secret_msg = 'cookie 未发生变化，无需回写'
+                print(f'🔐 {secret_msg}')
 
         summary = f'续期完成：成功 {renewed} 台，失败 {failed} 台'
         print(f'🎉 {summary}')
 
         # 组装 TG 通知（含最新 cookie，供手动兜底更新 Secret）
-        notice = f"PidginHost 续期\n{summary}\n详情：\n" + '\n'.join(details[-5:])
+        notice = f"✅ PidginHost 续期\n{summary}\n详情：\n" + '\n'.join(details[-5:])
         if latest_cookie:
             sid_v = latest_cookie.get('sessionid', '(未变)')
             csrf_v = latest_cookie.get('csrftoken', '(未变)')
             notice += f'\n\n🔑 最新 PANEL_COOKIE:\nsessionid={sid_v};\ncsrftoken={csrf_v};'
-            notice += '\n\n⚠️ 以上为本次会话最新 cookie（已自动回写 Secret 请忽略手动更新）'
-        emoji = '✅' if failed == 0 and not any('失败' in s for s in secret_notes) else '⚠️'
+            if cookie_saved:
+                notice += '\n\n✅ 已自动回写到 GitHub Secret PANEL_COOKIE，下次运行生效'
+            else:
+                notice += f'\n\n⚠️ {secret_msg}'
+                notice += '\n\n⚠️ 如需自动保存，请确保已配置 GH_PAT Secret（GitHub Personal Access Token）'
+        emoji = '✅' if failed == 0 else '⚠️'
         send_tg(emoji + ' ' + notice)
         sys.exit(0 if failed == 0 else 1)
 
@@ -286,7 +300,6 @@ def main():
         print(error_msg)
         send_tg(f'❌ 续期脚本崩溃\n{error_msg}')
         sys.exit(1)
-
 
 if __name__ == '__main__':
     main()
